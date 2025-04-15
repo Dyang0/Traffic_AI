@@ -1,16 +1,148 @@
 # main.py
-
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse, FileResponse
+import io
 import tensorflow as tf
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Any, Optional
-import os
+from pydantic import BaseModel
 
+from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score
+from tensorflow import keras
+from tensorflow.keras import layers
+from fastapi.middleware.cors import CORSMiddleware
+
+import os
 app = FastAPI()
 
-# Dictionary to cache loaded models
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Or set to specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def build_and_compile_model(norm):
+    model = keras.Sequential([
+        norm,
+        layers.Dense(64, activation='relu'),
+        layers.Dense(64, activation='relu'),
+        layers.Dense(1, activation='linear')
+    ])
+    model.compile(
+        loss='mean_absolute_error',
+        metrics=[keras.metrics.MeanSquaredError(), keras.metrics.MeanAbsoluteError()],
+        optimizer=keras.optimizers.Adam(0.0001)
+    )
+    return model
+
+def kfold(dataset: pd.DataFrame, epochs: int = 10, n_splits: int = 10):
+    dataset.dropna(inplace=True)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    test_results = {}
+
+    all_mse, all_mae, all_r2 = [], [], []
+
+    epsilon = 1e-6
+    dnn_model = None  # Initialize model reference outside loop
+
+    for i, (train_index, test_index) in enumerate(kf.split(dataset)):
+        dataset = dataset.copy()
+        train_dataset = dataset.iloc[train_index]
+        test_dataset = dataset.iloc[test_index]
+
+        train_transform = train_dataset.copy()
+        test_transform = test_dataset.copy()
+
+        # Log transform selected columns in both train and test
+        for col in ['CountStation', 'Weaving', 'Lanes', 'Curvature(degrees/100feet)', 'CalLength(meters)', 'CAR_SPEED_', 'ADT']:
+            train_transform[f'Log {col}'] = np.log(train_transform[col] + epsilon)
+            test_transform[f'Log {col}'] = np.log(test_transform[col] + epsilon)
+            del train_transform[col]
+            del test_transform[col]
+
+        train_features = train_transform.copy()
+        test_features = test_transform.copy()
+        train_labels = train_features.pop('Crashes')
+        test_labels = test_features.pop('Crashes')
+
+        # Only build and compile model once
+        if dnn_model is None:
+            normalizer = tf.keras.layers.Normalization(axis=-1)
+            normalizer.adapt(np.array(train_features))
+            dnn_model = build_and_compile_model(normalizer)
+
+        history = dnn_model.fit(
+            train_features,
+            train_labels,
+            validation_split=0.2,
+            epochs=epochs
+        )
+
+        y_pred = dnn_model.predict(test_features).flatten()
+
+        mse = np.mean((y_pred - test_labels) ** 2)
+        mae = np.mean(abs(y_pred - test_labels))
+        r2 = r2_score(test_labels, y_pred)
+
+        all_mse.append(mse)
+        all_mae.append(mae)
+        all_r2.append(r2)
+
+        test_results[f"Fold {i+1}"] = {"MSE": mse, "MAE": mae, "R²": r2}
+        print(f"Fold {i+1} - MSE: {mse:.4f}, MAE: {mae:.4f}, R^2: {r2:.4f}")
+
+    avg_mse = np.mean(all_mse)
+    avg_mae = np.mean(all_mae)
+    avg_r2 = np.mean(all_r2)
+
+    print(f"\n=== Final Averages Across All Folds ===")
+    print(f"Average MSE: {avg_mse:.4f}")
+    print(f"Average MAE: {avg_mae:.4f}")
+    print(f"Average R²: {avg_r2:.4f}")
+
+    dnn_model.save("dnnmodel.keras")
+    
+    return {
+    "Average MSE": round(np.mean(all_mse), 4),
+    "Average MAE": round(np.mean(all_mae), 4),
+    "Average R²": round(np.mean(all_r2), 4),
+    }
+
+
+
+
+
+
+@app.post("/train_model")
+async def train_model(file: UploadFile = File(...), epochs: int = Form(...), kfolds: int = Form(...)):
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+        results = kfold(df, epochs, kfolds)
+        return JSONResponse(content={"results": results})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+#downloads the most recent trained model (dnnmodel.keras) and sends it to the client from the train model page
+@app.get("/download_model")
+async def download_model():
+    file_path = os.path.join(os.path.dirname(__file__), "dnnmodel.keras")
+    print(f"Resolved path: {file_path}")
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Model file not found")
+
+    return FileResponse(
+        path=file_path,
+        filename="dnnmodel.keras",
+        media_type="application/octet-stream"
+    )
+#==================
+
+
 models_cache = {}
 
 def load_model(model_id: str):
