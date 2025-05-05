@@ -1,5 +1,7 @@
 # Developer's Manual
 
+*Access training/prediction data through the "new-project-data" zip
+
 ## Opening Terminals
 A new terminal must be opened when running each framework: MongoDB, FastAPI, and Next.js.
 
